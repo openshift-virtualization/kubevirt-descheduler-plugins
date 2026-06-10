@@ -42,7 +42,11 @@ Calling `Register` adds every plugin in this repository to the registry.  Adding
 
 ### Running tests
 
-The `go.mod` contains a `replace` directive pointing `sigs.k8s.io/descheduler` at a local checkout.  Update it to match your own path before running tests:
+```bash
+go test ./plugins/...
+```
+
+The `go.mod` `replace` directive pins `sigs.k8s.io/descheduler` to a specific commit of the `openshift/descheduler` fork.  If you need to test against a local descheduler checkout instead, override the replace directive:
 
 ```bash
 go mod edit -replace sigs.k8s.io/descheduler=/path/to/openshift/descheduler
@@ -76,7 +80,7 @@ No changes to the downstream descheduler carry commit are required.
 
 ## CI
 
-Unit tests run on every pull request via GitHub Actions (see `.github/workflows/test.yml`).  The workflow checks out both this repository and `openshift/descheduler`, rewrites the `replace` directive to the sibling checkout, and executes `go test ./plugins/...`.
+Unit tests run on every pull request via GitHub Actions (see `.github/workflows/test.yml`).  The workflow checks out this repository, sets up Go, and runs `go build`, `go vet`, and `go test ./plugins/...`.
 
 ---
 
