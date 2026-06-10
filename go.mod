@@ -10,7 +10,14 @@ require (
 	k8s.io/client-go v0.35.1
 	k8s.io/component-base v0.35.1
 	k8s.io/klog/v2 v2.130.1
-	sigs.k8s.io/descheduler v0.0.0-20260608174710-6e0ef538e703 // replaced by tiraboschi/descheduler; see replace block
+	sigs.k8s.io/descheduler v0.0.0-20260608174710-6e0ef538e703 // replaced by openshift/descheduler; see replace block
+)
+
+// replace directives are intentionally committed: Go's MVS ignores them in
+// indirect dependencies, so they never leak into the downstream descheduler build.
+replace (
+	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260127142750-a19766b6e2d4
+	sigs.k8s.io/descheduler => github.com/openshift/descheduler v0.0.0-20260610143345-3065c344e907
 )
 
 require (
@@ -74,12 +81,4 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
-)
-
-// replace directives are intentionally committed: Go's MVS ignores them in
-// indirect dependencies, so they never leak into the downstream descheduler build.
-replace (
-	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260127142750-a19766b6e2d4
-	// TODO: switch to github.com/openshift/descheduler once the ov_plugin branch is merged
-	sigs.k8s.io/descheduler => github.com/tiraboschi/descheduler v0.0.0-20260608174710-6e0ef538e703
 )
