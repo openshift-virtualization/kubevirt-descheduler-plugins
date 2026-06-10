@@ -763,7 +763,7 @@ k8s.io/utils/lru
 k8s.io/utils/net
 k8s.io/utils/ptr
 k8s.io/utils/trace
-# sigs.k8s.io/descheduler v0.0.0-20260608174710-6e0ef538e703 => github.com/tiraboschi/descheduler v0.0.0-20260608174710-6e0ef538e703
+# sigs.k8s.io/descheduler v0.0.0-20260608174710-6e0ef538e703 => github.com/openshift/descheduler v0.0.0-20260610143345-3065c344e907
 ## explicit; go 1.25.0
 sigs.k8s.io/descheduler/metrics
 sigs.k8s.io/descheduler/pkg/api
@@ -796,4 +796,4 @@ sigs.k8s.io/structured-merge-diff/v6/value
 ## explicit; go 1.22
 sigs.k8s.io/yaml
 # k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260127142750-a19766b6e2d4
-# sigs.k8s.io/descheduler => github.com/tiraboschi/descheduler v0.0.0-20260608174710-6e0ef538e703
+# sigs.k8s.io/descheduler => github.com/openshift/descheduler v0.0.0-20260610143345-3065c344e907
