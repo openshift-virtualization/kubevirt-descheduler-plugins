@@ -1,6 +1,6 @@
 module github.com/openshift-virtualization/kubevirt-descheduler-plugins
 
-go 1.24.6
+go 1.24.0
 
 godebug default=go1.24
 
