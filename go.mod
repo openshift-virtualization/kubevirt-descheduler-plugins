@@ -2,13 +2,13 @@ module github.com/openshift-virtualization/kubevirt-descheduler-plugins
 
 go 1.25.0
 
-toolchain go1.25.1
+godebug default=go1.24
 
 require (
 	k8s.io/api v0.35.1
 	k8s.io/apimachinery v0.35.1
 	k8s.io/client-go v0.35.1
-	k8s.io/component-base v0.35.1
+	k8s.io/component-base v0.34.1
 	k8s.io/klog/v2 v2.130.1
 	sigs.k8s.io/descheduler v0.0.0-20260608174710-6e0ef538e703 // replaced by openshift/descheduler; see replace block
 )
@@ -16,8 +16,8 @@ require (
 // replace directives are intentionally committed: Go's MVS ignores them in
 // indirect dependencies, so they never leak into the downstream descheduler build.
 replace (
-	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20260127142750-a19766b6e2d4
-	sigs.k8s.io/descheduler => github.com/openshift/descheduler v0.0.0-20260610143345-3065c344e907
+	k8s.io/kube-openapi => k8s.io/kube-openapi v0.0.0-20250710124328-f3f2b991d03b
+	sigs.k8s.io/descheduler => github.com/openshift/descheduler v0.0.0-20260730081701-5c30d0912a1b
 )
 
 require (

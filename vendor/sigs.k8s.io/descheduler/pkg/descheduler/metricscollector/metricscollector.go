@@ -108,8 +108,6 @@ func (mc *MetricsCollector) NodeUsage(node *v1.Node) (api.ReferencedResourceList
 }
 
 func (mc *MetricsCollector) HasSynced() bool {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
 	return mc.hasSynced
 }
 

@@ -27,9 +27,8 @@ import (
 	"go.opentelemetry.io/otel/propagation"
 	sdkresource "go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"go.opentelemetry.io/otel/trace"
-	"go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc/credentials"
 	"k8s.io/klog/v2"
 )
@@ -57,7 +56,7 @@ var (
 )
 
 func init() {
-	provider = noop.NewTracerProvider()
+	provider = trace.NewNoopTracerProvider()
 	tracer = provider.Tracer(TracerName)
 }
 
@@ -74,7 +73,7 @@ func NewTracerProvider(ctx context.Context, endpoint, caCert, name, namespace st
 		if err != nil && fallbackToNoOpTracer {
 			klog.ErrorS(err, "ran into an error trying to setup a trace provider. Falling back to NoOp provider")
 			err = nil
-			provider = noop.NewTracerProvider()
+			provider = trace.NewNoopTracerProvider()
 		}
 		otel.SetTextMapPropagator(propagation.TraceContext{})
 		otel.SetTracerProvider(provider)
@@ -86,8 +85,8 @@ func NewTracerProvider(ctx context.Context, endpoint, caCert, name, namespace st
 
 	if endpoint == "" {
 		klog.V(2).Info("Did not find a trace collector endpoint defined. Switching to NoopTraceProvider")
-		provider = noop.NewTracerProvider()
-		return nil
+		provider = trace.NewNoopTracerProvider()
+		return
 	}
 
 	var opts []otlptracegrpc.Option
@@ -109,12 +108,6 @@ func NewTracerProvider(ctx context.Context, endpoint, caCert, name, namespace st
 	} else {
 		klog.Info("Enabling trace GRPC client in insecure mode")
 		opts = append(opts, otlptracegrpc.WithInsecure())
-	}
-
-	if os.Getenv("USER") == "" {
-		if err := os.Setenv("USER", "descheduler"); err != nil {
-			klog.ErrorS(err, "failed to set USER environment variable")
-		}
 	}
 
 	client := otlptracegrpc.NewClient(opts...)
@@ -145,7 +138,7 @@ func NewTracerProvider(ctx context.Context, endpoint, caCert, name, namespace st
 		sdktrace.WithResource(resource),
 	)
 	klog.V(2).Info("Successfully setup trace provider")
-	return nil
+	return
 }
 
 func defaultResourceOpts(name string) []sdkresource.Option {
