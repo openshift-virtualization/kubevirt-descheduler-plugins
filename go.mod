@@ -5,9 +5,9 @@ go 1.24.0
 godebug default=go1.24
 
 require (
-	k8s.io/api v0.34.1
-	k8s.io/apimachinery v0.34.1
-	k8s.io/client-go v0.34.1
+	k8s.io/api v0.34.0
+	k8s.io/apimachinery v0.34.0
+	k8s.io/client-go v0.34.0
 	k8s.io/component-base v0.34.0
 	k8s.io/klog/v2 v2.130.1
 	sigs.k8s.io/descheduler v0.0.0-20260608174710-6e0ef538e703 // replaced by openshift/descheduler; see replace block
