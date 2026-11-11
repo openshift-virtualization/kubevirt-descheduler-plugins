@@ -29,22 +29,25 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	k8smetrics "k8s.io/component-base/metrics"
-	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/dynamic/dynamicinformer"
+	listersv1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
+	k8smetrics "k8s.io/component-base/metrics"
+	"k8s.io/component-base/metrics/legacyregistry"
 	"k8s.io/klog/v2"
 
+	nodeutil "sigs.k8s.io/descheduler/pkg/descheduler/node"
 	frameworktypes "sigs.k8s.io/descheduler/pkg/framework/types"
 )
 
@@ -54,9 +57,16 @@ const (
 	// virt-launcher pods carry this annotation with the VMI name as value.
 	vmiAnnotationKey = "kubevirt.io/domain"
 
+	// These taints are maintained by the cluster-kube-descheduler-operator
+	// soft-tainter and classify nodes as appropriately utilized or overutilized.
+	appropriatelyUtilizedSoftTaintKey   = "nodeutilization.descheduler.openshift.io/appropriate"
+	appropriatelyUtilizedSoftTaintValue = "true"
+	overUtilizedSoftTaintKey            = "nodeutilization.descheduler.openshift.io/overutilized"
+	overUtilizedSoftTaintValue          = "true"
+
 	// VMI and VMIM GVRs in the kubevirt.io API group.
-	vmiGroup    = "kubevirt.io"
-	vmiVersion  = "v1"
+	vmiGroup     = "kubevirt.io"
+	vmiVersion   = "v1"
 	vmiResource  = "virtualmachineinstances"
 	vmimResource = "virtualmachineinstancemigrations"
 
@@ -65,6 +75,15 @@ const (
 
 	reasonMigrationInProgress = "migration_in_progress"
 	reasonCooldown            = "cooldown"
+	reasonNoEligibleTarget    = "no_eligible_target"
+)
+
+type softTainterClass int
+
+const (
+	underutilized softTainterClass = iota
+	appropriatelyUtilized
+	overutilized
 )
 
 var (
@@ -82,13 +101,15 @@ var (
 
 	// evictionBlocksTotal counts how many times the plugin prevented an eviction,
 	// labelled by reason, node, and namespace.  Use this to identify which nodes
-	// or tenant namespaces are experiencing repeated eviction gating.
+	// or tenant namespaces are experiencing repeated eviction gating. The
+	// cluster-kube-descheduler-operator consumes the `no_eligible_target`
+	// reason and `node` label for target-fit dampening; preserve that contract.
 	evictionBlocksTotal = k8smetrics.NewCounterVec(
 		&k8smetrics.CounterOpts{
 			Subsystem:      "descheduler",
 			Name:           "kubevirt_eviction_blocks_total",
 			Help:           "Number of virt-launcher pod evictions blocked by KubevirtMigrationAware, by reason, node, and namespace.",
-			StabilityLevel: k8smetrics.ALPHA,
+			StabilityLevel: k8smetrics.BETA,
 		},
 		[]string{"reason", "node", "namespace"},
 	)
@@ -183,24 +204,32 @@ func (h *migrationHistory) onVMIUpdate(oldObj, newObj interface{}) {
 //     completed a migration within the configured MigrationCooldown window,
 //     allowing the eviction loop to skip and try other candidates instead.
 type KubevirtMigrationAware struct {
-	logger    klog.Logger
-	handle    frameworktypes.Handle
-	args      *KubevirtMigrationAwareArgs
-	vmiLister cache.GenericLister
-	history   *migrationHistory
+	ctx                      context.Context
+	logger                   klog.Logger
+	handle                   frameworktypes.Handle
+	args                     *KubevirtMigrationAwareArgs
+	vmiLister                cache.GenericLister
+	nodeLister               listersv1.NodeLister
+	history                  *migrationHistory
+	softTainterTaintsChecked atomic.Bool
 }
 
 var _ frameworktypes.EvictorPlugin = &KubevirtMigrationAware{}
 
 // New builds the plugin from its arguments.
-// It creates a dedicated dynamic client and VMI informer so that Filter and
-// PreEvictionFilter can read VMI state from a local cache instead of hitting
-// the API server on every eviction decision.
+// It creates a dedicated VMI informer and uses the Node informer owned by the
+// descheduler framework. This lets Filter and PreEvictionFilter read their
+// required state from local caches instead of hitting the API server on every
+// eviction decision.
 func New(ctx context.Context, args runtime.Object, handle frameworktypes.Handle) (frameworktypes.Plugin, error) {
 	kmaArgs, ok := args.(*KubevirtMigrationAwareArgs)
 	if !ok {
 		return nil, fmt.Errorf("want args to be of type KubevirtMigrationAwareArgs, got %T", args)
 	}
+	if handle == nil || handle.ClientSet() == nil || handle.SharedInformerFactory() == nil {
+		return nil, fmt.Errorf("KubevirtMigrationAware requires a framework handle with a Kubernetes client and informer factory")
+	}
+	logger := klog.FromContext(ctx).WithValues("plugin", PluginName)
 
 	cfg, err := rest.InClusterConfig()
 	if err != nil {
@@ -215,6 +244,10 @@ func New(ctx context.Context, args runtime.Object, handle frameworktypes.Handle)
 	// Create an all-namespaces informer factory with no re-sync (0 = disabled).
 	factory := dynamicinformer.NewDynamicSharedInformerFactory(dynClient, 0)
 	vmiGenericInformer := factory.ForResource(vmiGVR)
+	// The framework registers this informer before plugin construction and owns
+	// its lifecycle. Retrieve the same lister here so the target-check path is
+	// explicit and directly testable.
+	nodeLister := handle.SharedInformerFactory().Core().V1().Nodes().Lister()
 
 	history := newMigrationHistory()
 	if _, err = vmiGenericInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -242,7 +275,6 @@ func New(ctx context.Context, args runtime.Object, handle frameworktypes.Handle)
 	//
 	// Requires list permission on virtualmachineinstancemigrations at the cluster
 	// level (all namespaces).
-	logger := klog.FromContext(ctx).WithValues("plugin", PluginName)
 	listCtx, listCancel := context.WithTimeout(ctx, cacheWarmupTimeout)
 	defer listCancel()
 	if vmimList, err := dynClient.Resource(vmimGVR).List(listCtx, metav1.ListOptions{}); err != nil {
@@ -251,7 +283,7 @@ func New(ctx context.Context, args runtime.Object, handle frameworktypes.Handle)
 		seedHistoryFromVMIMs(vmimList.Items, vmiGenericInformer.Lister(), history, kmaArgs.MigrationHistoryWindow.Duration, logger)
 	}
 
-	return newPlugin(ctx, kmaArgs, handle, vmiGenericInformer.Lister(), history)
+	return newPlugin(ctx, kmaArgs, handle, vmiGenericInformer.Lister(), nodeLister, history)
 }
 
 // seedHistoryFromVMIMs pre-populates migration history from a snapshot of
@@ -320,7 +352,10 @@ func seedHistoryFromVMIMs(items []unstructured.Unstructured, lister cache.Generi
 // newPlugin is the internal constructor used by both New (production) and tests.
 // Tests call this directly with a pre-populated fake lister, bypassing the
 // dynamic client and in-cluster config entirely.
-func newPlugin(ctx context.Context, args *KubevirtMigrationAwareArgs, handle frameworktypes.Handle, lister cache.GenericLister, history *migrationHistory) (frameworktypes.Plugin, error) {
+func newPlugin(ctx context.Context, args *KubevirtMigrationAwareArgs, handle frameworktypes.Handle, vmiLister cache.GenericLister, nodeLister listersv1.NodeLister, history *migrationHistory) (frameworktypes.Plugin, error) {
+	if requiresSoftTainterImprovementTarget(args) && nodeLister == nil {
+		return nil, fmt.Errorf("soft-tainter target filtering requires a Node lister")
+	}
 	logger := klog.FromContext(ctx).WithValues("plugin", PluginName)
 
 	registerMetricsOnce.Do(func() {
@@ -333,11 +368,13 @@ func newPlugin(ctx context.Context, args *KubevirtMigrationAwareArgs, handle fra
 		"historyWindow", args.MigrationHistoryWindow.Duration)
 
 	return &KubevirtMigrationAware{
-		logger:    logger,
-		handle:    handle,
-		args:      args,
-		vmiLister: lister,
-		history:   history,
+		ctx:        ctx,
+		logger:     logger,
+		handle:     handle,
+		args:       args,
+		vmiLister:  vmiLister,
+		nodeLister: nodeLister,
+		history:    history,
 	}, nil
 }
 
@@ -377,14 +414,18 @@ func (k *KubevirtMigrationAware) Filter(pod *v1.Pod) bool {
 //     progressively protected against churn.
 //  3. Cap: if MaxMigrationCooldown is non-zero, the result is capped there.
 func (k *KubevirtMigrationAware) PreEvictionFilter(pod *v1.Pod) bool {
+	_, isVirtLauncher := pod.Annotations[vmiAnnotationKey]
 	uObj, ok := k.getVMI(pod)
 	if !ok {
+		if isVirtLauncher {
+			return k.hasRequiredImprovementCandidate(pod)
+		}
 		return true
 	}
 
 	endTime, ok := migrationEndTime(uObj)
 	if !ok {
-		return true
+		return k.hasRequiredImprovementCandidate(pod)
 	}
 
 	// Step 1: base = max(configured, migration duration).
@@ -428,7 +469,111 @@ func (k *KubevirtMigrationAware) PreEvictionFilter(pod *v1.Pod) bool {
 		return false
 	}
 
-	return true
+	return k.hasRequiredImprovementCandidate(pod)
+}
+
+func (k *KubevirtMigrationAware) hasRequiredImprovementCandidate(pod *v1.Pod) bool {
+	if !requiresSoftTainterImprovementTarget(k.args) || k.hasImprovementCandidate(pod) {
+		return true
+	}
+
+	k.logger.V(3).Info("No soft-tainter-improving candidate node can fit virt-launcher pod, deferring eviction",
+		"pod", klog.KObj(pod), "vmi", pod.Annotations[vmiAnnotationKey], "node", pod.Spec.NodeName)
+	evictionBlocksTotal.WithLabelValues(reasonNoEligibleTarget, pod.Spec.NodeName, pod.Namespace).Inc()
+	return false
+}
+
+// hasImprovementCandidate returns true when a ready node other than the
+// current node both passes NodeFit and has an allowed soft-tainter-class
+// improvement from the source. It does not select or reserve the node; the
+// scheduler remains free to place the migration target elsewhere. The classes
+// are treated as hard constraints regardless of the pod's tolerations.
+func (k *KubevirtMigrationAware) hasImprovementCandidate(pod *v1.Pod) bool {
+	if k.handle == nil {
+		k.logger.Error(fmt.Errorf("framework handle is nil"), "Unable to find an improving target", "pod", klog.KObj(pod))
+		return false
+	}
+	if k.nodeLister == nil {
+		k.logger.Error(fmt.Errorf("Node lister is nil"), "Unable to find an improving target", "pod", klog.KObj(pod))
+		return false
+	}
+	// Fail closed: without the source node's current class we cannot verify
+	// that a candidate satisfies the configured soft-tainter transition.
+	source, err := k.nodeLister.Get(pod.Spec.NodeName)
+	if err != nil {
+		k.logger.Error(err, "Unable to get source node while finding an improving target", "pod", klog.KObj(pod))
+		return false
+	}
+	sourceClass := classifySoftTainterNode(source)
+
+	nodes, err := nodeutil.ReadyNodes(
+		k.ctx,
+		k.handle.ClientSet(),
+		k.nodeLister,
+		"",
+	)
+	if err != nil {
+		k.logger.Error(err, "Unable to list ready nodes while finding an improving target", "pod", klog.KObj(pod))
+		return false
+	}
+	if !hasSoftTainterTaint(nodes) && !k.softTainterTaintsChecked.Swap(true) {
+		k.logger.Info("No soft-tainter taints observed; requireSoftTainterImprovementTarget currently behaves like NodeFit",
+			"appropriateTaintKey", appropriatelyUtilizedSoftTaintKey,
+			"overutilizedTaintKey", overUtilizedSoftTaintKey)
+	}
+
+	candidates := make([]*v1.Node, 0, len(nodes))
+	for _, node := range nodes {
+		if isSoftTainterImprovementTarget(sourceClass, classifySoftTainterNode(node)) {
+			candidates = append(candidates, node)
+		}
+	}
+
+	return nodeutil.PodFitsAnyOtherNode(k.handle.GetPodsAssignedToNodeFunc(), pod, candidates)
+}
+
+func classifySoftTainterNode(node *v1.Node) softTainterClass {
+	class := underutilized
+	for _, taint := range node.Spec.Taints {
+		if taint.Effect != v1.TaintEffectPreferNoSchedule {
+			continue
+		}
+		if taint.Key == overUtilizedSoftTaintKey && taint.Value == overUtilizedSoftTaintValue {
+			return overutilized
+		}
+		if taint.Key == appropriatelyUtilizedSoftTaintKey && taint.Value == appropriatelyUtilizedSoftTaintValue {
+			class = appropriatelyUtilized
+		}
+	}
+	return class
+}
+
+func isSoftTainterImprovementTarget(source, target softTainterClass) bool {
+	if target == underutilized {
+		return true
+	}
+	return source == overutilized && target == appropriatelyUtilized
+}
+
+func requiresSoftTainterImprovementTarget(args *KubevirtMigrationAwareArgs) bool {
+	return args.RequireSoftTainterImprovementTarget != nil && *args.RequireSoftTainterImprovementTarget
+}
+
+func hasSoftTainterTaint(nodes []*v1.Node) bool {
+	for _, node := range nodes {
+		for _, taint := range node.Spec.Taints {
+			if taint.Effect != v1.TaintEffectPreferNoSchedule {
+				continue
+			}
+			if taint.Key == appropriatelyUtilizedSoftTaintKey && taint.Value == appropriatelyUtilizedSoftTaintValue {
+				return true
+			}
+			if taint.Key == overUtilizedSoftTaintKey && taint.Value == overUtilizedSoftTaintValue {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // getVMI looks up the VMI for a virt-launcher pod from the informer cache.

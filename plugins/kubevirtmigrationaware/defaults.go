@@ -21,6 +21,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -43,5 +44,8 @@ func SetDefaults_KubevirtMigrationAwareArgs(obj runtime.Object) {
 	}
 	if args.MigrationHistoryWindow.Duration == 0 {
 		args.MigrationHistoryWindow = metav1.Duration{Duration: defaultMigrationHistoryWindow}
+	}
+	if args.RequireSoftTainterImprovementTarget == nil {
+		args.RequireSoftTainterImprovementTarget = ptr.To(false)
 	}
 }

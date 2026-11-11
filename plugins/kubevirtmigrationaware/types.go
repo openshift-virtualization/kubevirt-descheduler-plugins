@@ -51,4 +51,18 @@ type KubevirtMigrationAwareArgs struct {
 	// MaxMigrationCooldown cap is reliably applied to chronically bouncing VMs.
 	// Defaults to 48h.
 	MigrationHistoryWindow metav1.Duration `json:"migrationHistoryWindow,omitempty"`
+
+	// RequireSoftTainterImprovementTarget prevents eviction of a virt-launcher
+	// pod unless it fits on another ready node whose OpenShift descheduler
+	// soft-tainter class has an allowed transition from the source class: any
+	// source may target an underutilized node, and an overutilized source may
+	// also target an appropriately utilized node. This makes the soft-tainter's
+	// PreferNoSchedule hints mandatory for
+	// this pre-eviction decision. It establishes only that a fitting candidate
+	// exists; it neither selects nor reserves KubeVirt's eventual migration
+	// target, and is only a subset of the scheduler's feasibility checks.
+	// Defaults to false when unset. A pointer preserves the distinction between
+	// an omitted value and an explicitly configured false value, allowing a
+	// future default change without overriding explicit configuration.
+	RequireSoftTainterImprovementTarget *bool `json:"requireSoftTainterImprovementTarget,omitempty"`
 }

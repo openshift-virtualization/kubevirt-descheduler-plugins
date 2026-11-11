@@ -21,13 +21,68 @@ import (
 	"testing"
 	"time"
 
+	promapi "github.com/prometheus/client_golang/api"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/informers"
+	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/ptr"
+
+	"sigs.k8s.io/descheduler/pkg/descheduler/metricscollector"
+	podutil "sigs.k8s.io/descheduler/pkg/descheduler/pod"
+	frameworktypes "sigs.k8s.io/descheduler/pkg/framework/types"
 )
+
+type testHandle struct {
+	factory informers.SharedInformerFactory
+	pods    map[string][]*v1.Pod
+}
+
+func (h *testHandle) ClientSet() clientset.Interface   { return nil }
+func (h *testHandle) PrometheusClient() promapi.Client { return nil }
+func (h *testHandle) Evictor() frameworktypes.Evictor  { return nil }
+func (h *testHandle) GetPodsAssignedToNodeFunc() podutil.GetPodsAssignedToNodeFunc {
+	return func(nodeName string, filter podutil.FilterFunc) ([]*v1.Pod, error) {
+		var result []*v1.Pod
+		for _, pod := range h.pods[nodeName] {
+			if filter == nil || filter(pod) {
+				result = append(result, pod)
+			}
+		}
+		return result, nil
+	}
+}
+func (h *testHandle) SharedInformerFactory() informers.SharedInformerFactory { return h.factory }
+func (h *testHandle) MetricsCollector() *metricscollector.MetricsCollector   { return nil }
+func (h *testHandle) PluginInstanceID() string                               { return "test" }
+
+func newTestHandle(t *testing.T, nodes ...*v1.Node) *testHandle {
+	t.Helper()
+	factory := informers.NewSharedInformerFactory(nil, 0)
+	indexer := factory.Core().V1().Nodes().Informer().GetIndexer()
+	for _, node := range nodes {
+		if err := indexer.Add(node); err != nil {
+			t.Fatalf("add node %q to informer: %v", node.Name, err)
+		}
+	}
+	return &testHandle{factory: factory, pods: map[string][]*v1.Pod{}}
+}
+
+func makeReadyNode(name string, taints ...v1.Taint) *v1.Node {
+	return &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec:       v1.NodeSpec{Taints: taints},
+		Status: v1.NodeStatus{
+			Allocatable: v1.ResourceList{v1.ResourcePods: resource.MustParse("10")},
+			Conditions:  []v1.NodeCondition{{Type: v1.NodeReady, Status: v1.ConditionTrue}},
+		},
+	}
+}
 
 // makeVMI builds an unstructured VMI object with optional migrationState.
 // migrationState may be nil (no migration ever ran), a map with only
@@ -139,11 +194,190 @@ func newTestPlugin(t *testing.T, cooldown, maxCooldown time.Duration, vmis ...*u
 		MaxMigrationCooldown:   metav1.Duration{Duration: maxCooldown},
 		MigrationHistoryWindow: metav1.Duration{Duration: defaultMigrationHistoryWindow},
 	}
-	pg, err := newPlugin(context.Background(), args, nil, makeVMILister(vmis...), newMigrationHistory())
+	pg, err := newPlugin(context.Background(), args, nil, makeVMILister(vmis...), nil, newMigrationHistory())
 	if err != nil {
 		t.Fatalf("newPlugin: %v", err)
 	}
 	return pg.(*KubevirtMigrationAware)
+}
+
+func newTargetAwareTestPlugin(t *testing.T, handle frameworktypes.Handle, vmis ...*unstructured.Unstructured) *KubevirtMigrationAware {
+	t.Helper()
+	args := &KubevirtMigrationAwareArgs{
+		MigrationCooldown:                   metav1.Duration{Duration: defaultMigrationCooldown},
+		MaxMigrationCooldown:                metav1.Duration{Duration: defaultMaxMigrationCooldown},
+		MigrationHistoryWindow:              metav1.Duration{Duration: defaultMigrationHistoryWindow},
+		RequireSoftTainterImprovementTarget: ptr.To(true),
+	}
+	nodeLister := handle.SharedInformerFactory().Core().V1().Nodes().Lister()
+	pg, err := newPlugin(context.Background(), args, handle, makeVMILister(vmis...), nodeLister, newMigrationHistory())
+	if err != nil {
+		t.Fatalf("newPlugin: %v", err)
+	}
+	return pg.(*KubevirtMigrationAware)
+}
+
+func TestPreEvictionFilterRequiresImprovementTarget(t *testing.T) {
+	const namespace = "default"
+	const vmiName = "vm-a"
+	pod := makeVirtLauncherPod(namespace, "virt-launcher-a", "source", vmiName)
+	vmi := makeVMI(namespace, vmiName, nil)
+	softTaint := v1.Taint{
+		Key:    overUtilizedSoftTaintKey,
+		Value:  overUtilizedSoftTaintValue,
+		Effect: v1.TaintEffectPreferNoSchedule,
+	}
+	appropriateTaint := v1.Taint{
+		Key:    "nodeutilization.descheduler.openshift.io/appropriate",
+		Value:  "true",
+		Effect: v1.TaintEffectPreferNoSchedule,
+	}
+
+	t.Run("defers overutilized source when every alternative target is overutilized", func(t *testing.T) {
+		handle := newTestHandle(t,
+			makeReadyNode("source", softTaint),
+			makeReadyNode("target", softTaint),
+		)
+		plugin := newTargetAwareTestPlugin(t, handle, vmi)
+		if plugin.PreEvictionFilter(pod) {
+			t.Fatal("PreEvictionFilter() = true, want false when no improving target fits")
+		}
+	})
+
+	t.Run("allows overutilized source when an underutilized target fits", func(t *testing.T) {
+		handle := newTestHandle(t,
+			makeReadyNode("source", softTaint),
+			makeReadyNode("soft-tainted", softTaint),
+			makeReadyNode("target"),
+		)
+		plugin := newTargetAwareTestPlugin(t, handle, vmi)
+		if !plugin.PreEvictionFilter(pod) {
+			t.Fatal("PreEvictionFilter() = false, want true when an underutilized target fits")
+		}
+	})
+
+	t.Run("allows overutilized source when an appropriately utilized target fits", func(t *testing.T) {
+		handle := newTestHandle(t,
+			makeReadyNode("source", softTaint),
+			makeReadyNode("target", appropriateTaint),
+		)
+		plugin := newTargetAwareTestPlugin(t, handle, vmi)
+		if !plugin.PreEvictionFilter(pod) {
+			t.Fatal("PreEvictionFilter() = false, want true when an appropriately utilized target improves an overutilized source")
+		}
+	})
+
+	t.Run("defers appropriately utilized source when only an appropriately utilized target fits", func(t *testing.T) {
+		handle := newTestHandle(t,
+			makeReadyNode("source", appropriateTaint),
+			makeReadyNode("target", appropriateTaint),
+		)
+		plugin := newTargetAwareTestPlugin(t, handle, vmi)
+		if plugin.PreEvictionFilter(pod) {
+			t.Fatal("PreEvictionFilter() = true, want false when the target does not improve an appropriately utilized source")
+		}
+	})
+
+	t.Run("allows appropriately utilized source when an underutilized target fits", func(t *testing.T) {
+		handle := newTestHandle(t,
+			makeReadyNode("source", appropriateTaint),
+			makeReadyNode("target"),
+		)
+		plugin := newTargetAwareTestPlugin(t, handle, vmi)
+		if !plugin.PreEvictionFilter(pod) {
+			t.Fatal("PreEvictionFilter() = false, want true when an underutilized target fits")
+		}
+	})
+
+	t.Run("does not filter generic pods", func(t *testing.T) {
+		plugin := newTargetAwareTestPlugin(t, newTestHandle(t), vmi)
+		if !plugin.PreEvictionFilter(makePlainPod(namespace, "generic", "source")) {
+			t.Fatal("PreEvictionFilter() = false, want true for a non-virt-launcher pod")
+		}
+	})
+}
+
+func TestClassifySoftTainterNode(t *testing.T) {
+	tests := []struct {
+		name   string
+		taints []v1.Taint
+		want   softTainterClass
+	}{
+		{
+			name: "unmarked node is underutilized",
+			want: underutilized,
+		},
+		{
+			name:   "appropriately utilized soft taint",
+			taints: []v1.Taint{{Key: appropriatelyUtilizedSoftTaintKey, Value: appropriatelyUtilizedSoftTaintValue, Effect: v1.TaintEffectPreferNoSchedule}},
+			want:   appropriatelyUtilized,
+		},
+		{
+			name: "overutilized taint takes precedence",
+			taints: []v1.Taint{
+				{Key: appropriatelyUtilizedSoftTaintKey, Value: appropriatelyUtilizedSoftTaintValue, Effect: v1.TaintEffectPreferNoSchedule},
+				{Key: overUtilizedSoftTaintKey, Value: overUtilizedSoftTaintValue, Effect: v1.TaintEffectPreferNoSchedule},
+			},
+			want: overutilized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			node := makeReadyNode("node", tt.taints...)
+			if got := classifySoftTainterNode(node); got != tt.want {
+				t.Errorf("classifySoftTainterNode() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSoftTainterTargetTransitions(t *testing.T) {
+	tests := []struct {
+		name   string
+		source softTainterClass
+		target softTainterClass
+		want   bool
+	}{
+		{name: "underutilized source can remain underutilized", source: underutilized, target: underutilized, want: true},
+		{name: "appropriately utilized source can target underutilized", source: appropriatelyUtilized, target: underutilized, want: true},
+		{name: "appropriately utilized source cannot target appropriate", source: appropriatelyUtilized, target: appropriatelyUtilized, want: false},
+		{name: "overutilized source can target appropriate", source: overutilized, target: appropriatelyUtilized, want: true},
+		{name: "overutilized source cannot target overutilized", source: overutilized, target: overutilized, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isSoftTainterImprovementTarget(tt.source, tt.target); got != tt.want {
+				t.Errorf("isSoftTainterImprovementTarget(%v, %v) = %t, want %t", tt.source, tt.target, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewPluginRequiresNodeListerWhenTargetFilteringEnabled(t *testing.T) {
+	args := &KubevirtMigrationAwareArgs{RequireSoftTainterImprovementTarget: ptr.To(true)}
+	if _, err := newPlugin(context.Background(), args, nil, makeVMILister(), nil, newMigrationHistory()); err == nil {
+		t.Fatal("newPlugin() succeeded without a Node lister while target filtering is enabled")
+	}
+}
+
+func TestHasSoftTainterTaint(t *testing.T) {
+	recognized := v1.Taint{Key: appropriatelyUtilizedSoftTaintKey, Value: appropriatelyUtilizedSoftTaintValue, Effect: v1.TaintEffectPreferNoSchedule}
+	wrongEffect := recognized
+	wrongEffect.Effect = v1.TaintEffectNoSchedule
+	wrongValue := recognized
+	wrongValue.Value = "unexpected"
+
+	if hasSoftTainterTaint([]*v1.Node{makeReadyNode("node", recognized)}) != true {
+		t.Error("hasSoftTainterTaint() = false, want true for recognized soft-taint")
+	}
+	if hasSoftTainterTaint([]*v1.Node{makeReadyNode("node", wrongEffect)}) != false {
+		t.Error("hasSoftTainterTaint() = true, want false for hard taint")
+	}
+	if hasSoftTainterTaint([]*v1.Node{makeReadyNode("node", wrongValue)}) != false {
+		t.Error("hasSoftTainterTaint() = true, want false for an unrecognized taint value")
+	}
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
@@ -349,11 +583,11 @@ func TestPreEvictionFilterAdaptiveCooldown(t *testing.T) {
 	now := time.Now()
 
 	cases := []struct {
-		description   string
-		migStart      time.Duration // relative to now
-		migEnd        time.Duration // relative to now
-		maxCooldown   time.Duration // 0 = disabled
-		wantAllow     bool
+		description string
+		migStart    time.Duration // relative to now
+		migEnd      time.Duration // relative to now
+		maxCooldown time.Duration // 0 = disabled
+		wantAllow   bool
 	}{
 		{
 			// Small VM: 2-minute migration — configured 15m dominates.
@@ -442,9 +676,9 @@ func TestPreEvictionFilterAdaptiveCooldown(t *testing.T) {
 
 func TestPreEvictionFilterExponentialBackoff(t *testing.T) {
 	const (
-		ns          = "default"
-		cooldown    = 15 * time.Minute
-		vmiUID      = types.UID("uid-vm-backoff")
+		ns       = "default"
+		cooldown = 15 * time.Minute
+		vmiUID   = types.UID("uid-vm-backoff")
 	)
 	now := time.Now()
 
@@ -619,7 +853,7 @@ func TestPreEvictionFilterSteadyStateReachesMaxCooldown(t *testing.T) {
 			MaxMigrationCooldown:   metav1.Duration{Duration: maxCD},
 			MigrationHistoryWindow: metav1.Duration{Duration: window},
 		}
-		pg, err := newPlugin(context.Background(), args, nil, makeVMILister(vmi), h)
+		pg, err := newPlugin(context.Background(), args, nil, makeVMILister(vmi), nil, h)
 		if err != nil {
 			t.Fatalf("newPlugin: %v", err)
 		}

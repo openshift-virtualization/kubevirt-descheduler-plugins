@@ -346,12 +346,24 @@ the descheduler profile.  Listing it under only one extension point silently
 disables the other; there is no error.
 
 The `DefaultEvictor` is automatically injected by the descheduler and does not
-need to appear in the `plugins` section.  It does however need an explicit
-`pluginConfig` entry if you want non-default behaviour.  For KubeVirt workloads
-`nodeFit: true` is strongly recommended: it makes the descheduler verify that a
-suitable destination node exists before issuing an eviction, preventing a VM
-from being evicted into a situation where the scheduler has nowhere valid to
-place it.
+need to appear in the `plugins` section. It does however need an explicit
+`pluginConfig` entry if you want non-default behaviour.
+
+`nodeFit: true` is a useful generic-pod guard, but it is not sufficient to
+ensure that a VM migration improves placement. It asks only whether the pod
+fits on *some* other ready node. It does not know the LowNodeUtilization node
+classification and it deliberately ignores the soft-tainter's
+`PreferNoSchedule` hints. Consequently, an overutilized VM source can pass
+`nodeFit` solely because another overutilized node is feasible.
+
+For a `virt-launcher` eviction, KubeVirt turns the eviction into a live
+migration. If KubeVirt cannot schedule its migration target, the migration
+does not complete and the VM stays on its source node. That gives migrations
+an inherent liveness check which generic `nodeFit` usefully approximates for
+ordinary pods, but it does not answer the separate question of whether an
+available target would be an improvement. Set
+`requireSoftTainterImprovementTarget: true` to require a fitting target with
+an allowed soft-tainter transition during this plugin's pre-eviction check.
 
 ```yaml
 apiVersion: "descheduler/v1alpha2"
@@ -364,9 +376,10 @@ profiles:
           migrationCooldown: 15m
           maxMigrationCooldown: 6h
           migrationHistoryWindow: 48h
+          requireSoftTainterImprovementTarget: true # require a soft-tainter-class improvement
       - name: DefaultEvictor
         args:
-          nodeFit: true   # only evict when a valid destination node exists
+          nodeFit: true   # optional generic-pod best-effort feasibility guard
       - name: LowNodeUtilization
         args:
           thresholds:
@@ -421,8 +434,13 @@ Incremented each time the plugin prevents an eviction, labelled by `reason`,
 |---|---|---|
 | `reason` | `migration_in_progress` | Blocked by `Filter`: VMI has an active migration. |
 | `reason` | `cooldown` | Blocked by `PreEvictionFilter`: VMI is within its cooldown window. |
+| `reason` | `no_eligible_target` | Blocked by `PreEvictionFilter`: no fitting node satisfied the allowed soft-tainter transition. |
 | `node` | node name | The node the `virt-launcher` pod was scheduled on. |
 | `namespace` | namespace name | The namespace of the `virt-launcher` pod and VMI. |
+
+`reason="no_eligible_target"` and the `node` label are a compatibility
+contract with the cluster-kube-descheduler-operator's target-fit dampening
+rules. Do not rename or remove them without updating the paired operator rule.
 
 **`descheduler_kubevirt_effective_cooldown_seconds`** — histogram
 
@@ -485,6 +503,34 @@ nudging the scheduler away from them.  This works well for most workloads, but
 a VM that carries specific scheduling constraints — `nodeSelector`, `nodeAffinity`,
 pod affinity rules, or a narrow set of tolerated taints — can bypass
 `PreferNoSchedule` entirely and land back on a suboptimal node regardless.
+
+Set `requireSoftTainterImprovementTarget: true` to make the operator
+soft-tainter classifications mandatory for this plugin's pre-eviction decision:
+any source may target an underutilized node, while an overutilized source may
+also target an appropriately utilized node. The plugin establishes only that
+another ready node passes the
+descheduler's `NodeFit` checks and satisfies that transition. It does not
+select or reserve that node, and KubeVirt/the scheduler can still place the
+migration target elsewhere. It also does not replicate every Kubernetes
+scheduler predicate.
+
+The soft-tainter and this plugin are asynchronous. The soft-tainter computes
+utilization from Prometheus and updates node taints independently of the
+descheduler's balance cycle; this plugin reads the taints from its informer
+cache independently of both. A classification can therefore be stale or can
+change after the pre-eviction check and before KubeVirt schedules the migration
+target. The option is intentionally a conservative admission check—"an
+improving candidate was observed"—not a target reservation or a scheduler
+placement guarantee.
+
+The classification depends on the OpenShift soft-tainter's exact
+`PreferNoSchedule` taint keys. Nodes without either recognized taint are
+treated as underutilized. Therefore, if the soft-tainter is disabled,
+misconfigured, or has not yet applied taints, the guard degrades to a
+NodeFit-style check; the plugin logs this condition the first time a target
+check observes no recognized soft-taints. Candidate discovery currently considers all ready
+nodes, rather than the descheduler policy's node selector, so VM scheduling
+constraints must still keep unsuitable nodes out of the feasible set.
 
 When that happens this plugin's cooldown mechanism provides a backstop: the VM
 that just migrated onto the wrong node will not be immediately re-evicted in a
