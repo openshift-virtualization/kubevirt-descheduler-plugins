@@ -19,6 +19,8 @@ package kubevirtmigrationaware
 import (
 	"testing"
 	"time"
+
+	"k8s.io/utils/ptr"
 )
 
 func TestSetDefaults(t *testing.T) {
@@ -34,6 +36,9 @@ func TestSetDefaults(t *testing.T) {
 		if args.MigrationHistoryWindow.Duration != defaultMigrationHistoryWindow {
 			t.Errorf("MigrationHistoryWindow = %v, want %v", args.MigrationHistoryWindow.Duration, defaultMigrationHistoryWindow)
 		}
+		if args.RequireSoftTainterImprovementTarget == nil || *args.RequireSoftTainterImprovementTarget {
+			t.Errorf("RequireSoftTainterImprovementTarget = %v, want explicit false", args.RequireSoftTainterImprovementTarget)
+		}
 	})
 
 	t.Run("explicit values are preserved", func(t *testing.T) {
@@ -41,6 +46,7 @@ func TestSetDefaults(t *testing.T) {
 		args.MigrationCooldown.Duration = 10 * time.Minute
 		args.MaxMigrationCooldown.Duration = 4 * time.Hour
 		args.MigrationHistoryWindow.Duration = 12 * time.Hour
+		args.RequireSoftTainterImprovementTarget = ptr.To(true)
 		SetDefaults_KubevirtMigrationAwareArgs(args)
 		if args.MigrationCooldown.Duration != 10*time.Minute {
 			t.Errorf("MigrationCooldown = %v, want 10m", args.MigrationCooldown.Duration)
@@ -50,6 +56,19 @@ func TestSetDefaults(t *testing.T) {
 		}
 		if args.MigrationHistoryWindow.Duration != 12*time.Hour {
 			t.Errorf("MigrationHistoryWindow = %v, want 12h", args.MigrationHistoryWindow.Duration)
+		}
+		if args.RequireSoftTainterImprovementTarget == nil || !*args.RequireSoftTainterImprovementTarget {
+			t.Errorf("RequireSoftTainterImprovementTarget = %v, want explicit true", args.RequireSoftTainterImprovementTarget)
+		}
+	})
+
+	t.Run("explicit false is preserved", func(t *testing.T) {
+		args := &KubevirtMigrationAwareArgs{
+			RequireSoftTainterImprovementTarget: ptr.To(false),
+		}
+		SetDefaults_KubevirtMigrationAwareArgs(args)
+		if args.RequireSoftTainterImprovementTarget == nil || *args.RequireSoftTainterImprovementTarget {
+			t.Errorf("RequireSoftTainterImprovementTarget = %v, want explicit false", args.RequireSoftTainterImprovementTarget)
 		}
 	})
 }

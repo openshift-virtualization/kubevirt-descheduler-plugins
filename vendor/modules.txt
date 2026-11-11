@@ -770,6 +770,7 @@ sigs.k8s.io/descheduler/pkg/api
 sigs.k8s.io/descheduler/pkg/descheduler/evictions
 sigs.k8s.io/descheduler/pkg/descheduler/evictions/utils
 sigs.k8s.io/descheduler/pkg/descheduler/metricscollector
+sigs.k8s.io/descheduler/pkg/descheduler/node
 sigs.k8s.io/descheduler/pkg/descheduler/pod
 sigs.k8s.io/descheduler/pkg/features
 sigs.k8s.io/descheduler/pkg/framework/pluginregistry

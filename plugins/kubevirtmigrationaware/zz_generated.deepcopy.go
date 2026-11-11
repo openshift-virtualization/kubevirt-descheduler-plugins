@@ -32,6 +32,11 @@ func (in *KubevirtMigrationAwareArgs) DeepCopyInto(out *KubevirtMigrationAwareAr
 	out.MigrationCooldown = in.MigrationCooldown
 	out.MaxMigrationCooldown = in.MaxMigrationCooldown
 	out.MigrationHistoryWindow = in.MigrationHistoryWindow
+	if in.RequireSoftTainterImprovementTarget != nil {
+		in, out := &in.RequireSoftTainterImprovementTarget, &out.RequireSoftTainterImprovementTarget
+		*out = new(bool)
+		**out = **in
+	}
 	return
 }
 
